@@ -1,0 +1,349 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Gene List Explorer</title>
+  <style>
+    body{font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; max-width: 1100px; margin: 24px auto; padding: 0 16px}
+    textarea{width: 100%; height: 160px}
+    .row{display:flex; gap:16px}
+    .col{flex:1}
+    table{width:100%; border-collapse: collapse; margin-top: 8px}
+    th,td{border:1px solid #ddd; padding:6px; font-size: 13px; vertical-align: top}
+    th{background:#fafafa; text-align:left}
+    .muted{color:#666}
+    .grid{display:grid; grid-template-columns: repeat(auto-fill, minmax(420px,1fr)); gap:16px}
+    .warn{color:#a00; font-size: 13px; margin: 6px 0;}
+    .controls{display:flex; gap:12px; align-items:center; flex-wrap:wrap}
+    input[type="text"]{width:280px; padding:6px 8px}
+    h3{margin:8px 0}
+    .subtle{margin:6px 0 0 0; font-size:13px; color:#444}
+    .pager{display:flex; align-items:center; gap:8px; margin:8px 0}
+    .pager button:disabled{opacity:0.5; cursor:not-allowed}
+  </style>
+</head>
+<body>
+  <h1>Harmonizome (CTD only) + OpenTargets Gene List Explorer</h1>
+  <p class="muted">Paste HGNC symbols (one per line or comma separated). Back-end: FastAPI.</p>
+
+  <div class="row">
+    <div class="col">
+      <textarea id="genes" placeholder="SFTPC
+KRT8
+CEBPD
+MGST1"></textarea>
+      <div class="controls">
+        <label><input type="checkbox" id="hzChk" checked> Harmonizome (CTD)</label>
+        <label><input type="checkbox" id="otChk" checked> OpenTargets</label>
+        <label>Top N (OT): <input type="number" id="topn" value="15" min="1" max="50" style="width:64px"></label>
+      </div>
+      <div class="controls">
+        <input id="disease" type="text" placeholder='Disease filter e.g. fibrosis or "fibrosis" (perfect)' />
+        <label><input type="radio" name="mode" value="auto" checked> Auto</label>
+        <label><input type="radio" name="mode" value="simple"> Simple</label>
+        <label><input type="radio" name="mode" value="exact"> Perfect</label>
+        <button id="run">Run</button>
+        <span id="status" class="muted"></span>
+      </div>
+    </div>
+  </div>
+
+  <h2>Mappings</h2>
+  <div id="map"></div>
+
+  <h2>OpenTargets (Top-N per gene)</h2>
+  <div id="otLinks" class="subtle"></div>
+  <div id="otOut"></div>
+  <div id="otPagerBottom" class="pager"></div>
+
+  <h2>Harmonizome (CTD Gene-Disease Associations)</h2>
+  <div id="hzOut"></div>
+  <div id="hzPagerBottom" class="pager"></div>
+
+<script>
+/* ===== OpenTargets helpers ===== */
+const REF_LABEL = {
+  europepmc: 'Europe PMC', reactome: 'Reactome', chembl: 'ChEMBL',
+  eva: 'ClinVar / EVA', genomics_england: 'Genomics England', clingen: 'ClinGen',
+  gene2phenotype: 'Gene2Phenotype', gwas_credible_sets: 'GWAS credible sets',
+  gwas_catalog: 'GWAS Catalog', opentargets: 'OpenTargets', impc: 'IMPC',
+  uniprot_variants: 'UniProt variants', uniprot_literature: 'UniProt literature',
+  orphanet: 'Orphanet', expression_atlas: 'Expression Atlas',
+};
+/* rows → disease|reference|score 로 평탄화 + 점수 내림차순 */
+function flattenOTRows(rows){
+  const out = [];
+  (rows || []).forEach(r => {
+    const disease = (r && r.disease_name) || '';
+    const dss = (r && r.datasourceScores) || [];
+    dss.forEach(ds => {
+      out.push({
+        disease_name: disease,
+        ref: REF_LABEL[ds.id] || ds.id,
+        score: ds.score
+      });
+    });
+  });
+  out.sort((a,b) => (b.score ?? -1) - (a.score ?? -1));
+  return out;
+}
+/* 매핑으로부터 OT associations 페이지 링크 테이블 생성 */
+function buildOTLinks(mappings){
+  const rows = (mappings||[])
+    .filter(m => m.ensembl_id)
+    .map(m => ({
+      gene: m.symbol,
+      url: `https://platform.opentargets.org/target/${m.ensembl_id}/associations`
+    }));
+  if (rows.length === 0) return null;
+  const tbl = tableFrom(rows, [
+    {key:'gene', label:'Gene'},
+    {key:'url',  label:'Link'}
+  ]);
+  // 링크 셀 하이퍼링크화
+  tbl.querySelectorAll('tbody tr').forEach(tr=>{
+    const td = tr.lastElementChild;
+    const href = td.textContent.trim();
+    td.innerHTML = `<a href="${href}" target="_blank" rel="noopener noreferrer">OpenTargets associations</a>`;
+  });
+  return tbl;
+}
+
+/* ===== common helpers ===== */
+function splitSymbols(txt){
+  return Array.from(new Set((txt||'').split(/\n|,|\t|;|\s+/).map(s=>s.trim()).filter(Boolean)));
+}
+function el(tag, attrs={}, children=[]) {
+  const node = document.createElement(tag);
+  Object.entries(attrs).forEach(([k,v])=>{
+    if (k === 'class') node.className = v;
+    else node.setAttribute(k, v);
+  });
+  (Array.isArray(children)?children:[children]).forEach(c=>{
+    if (typeof c === 'string') node.appendChild(document.createTextNode(c));
+    else if (c) node.appendChild(c);
+  });
+  return node;
+}
+function tableFrom(rows, columns){
+  const tbl = el('table');
+  const thead = el('thead');
+  const trh = el('tr');
+  columns.forEach(c=> trh.appendChild(el('th',{},c.label)));
+  thead.appendChild(trh); tbl.appendChild(thead);
+  const tbody = el('tbody');
+  rows.forEach(r=>{
+    const tr = el('tr');
+    columns.forEach(c=> tr.appendChild(el('td',{}, String((r||{})[c.key] ?? ''))));
+    tbody.appendChild(tr);
+  });
+  tbl.appendChild(tbody);
+  return tbl;
+}
+function renderPager(container, page, total, onPrev, onNext){
+  container.innerHTML = '';
+  const prev = el('button',{type:'button'},'Prev');
+  prev.disabled = page<=1;
+  prev.addEventListener('click',onPrev);
+  const info = el('span',{},`Page ${page}/${total}`);
+  const next = el('button',{type:'button'},'Next');
+  next.disabled = page>=total;
+  next.addEventListener('click',onNext);
+  container.appendChild(prev);
+  container.appendChild(info);
+  container.appendChild(next);
+}
+function toHarmonizomePageUrl(href){
+  if (!href) return '';
+  let u = href.trim();
+  if (u.startsWith('/')) u = 'https://maayanlab.cloud' + u;
+  try {
+    const urlObj = new URL(u);
+    urlObj.pathname = urlObj.pathname.replace(/^\/api\/1\.0\/gene_set\//, '/Harmonizome/gene_set/');
+    return urlObj.toString();
+  } catch {
+    return u.replace('/api/1.0/gene_set/', '/Harmonizome/gene_set/');
+  }
+}
+function paginate(keys,page){const total=Math.max(1,Math.ceil(keys.length/4));const p=Math.min(Math.max(1,page),total);const start=(p-1)*4;return{page:p,total,slice:keys.slice(start,start+4)};}
+let lastData=null; let otPage=1,hzPage=1;
+function isInvalidGene(sym){
+  const m=(lastData?.mappings||[]).find(x=>x.symbol===sym);
+  return !m || !m.ensembl_id;
+}
+
+/* ===== renderers ===== */
+function renderMappings(data){
+  const mapDiv=document.getElementById('map');
+  mapDiv.innerHTML='';
+  const tableData=(data.mappings||[]).map(m=>{
+    if(!m.ensembl_id){
+      return {symbol:m.symbol,matched_symbol:`There are no named "${m.symbol}"`,ensembl_id:''};
+    }else{
+      return {symbol:m.symbol,matched_symbol:m.matched_symbol||'',ensembl_id:m.ensembl_id||''};
+    }
+  });
+  mapDiv.appendChild(tableFrom(tableData,[
+    {key:'symbol',label:'Symbol'},
+    {key:'matched_symbol',label:'Matched'},
+    {key:'ensembl_id',label:'Ensembl ID'}
+  ]));
+}
+
+function renderOT(){
+  const otDiv = document.getElementById('otOut');
+  const otLinksDiv = document.getElementById('otLinks');
+  const otPagerBottom = document.getElementById('otPagerBottom');
+  otDiv.innerHTML = ''; otLinksDiv.innerHTML=''; otPagerBottom.innerHTML='';
+
+  if (!lastData || !lastData.opentargets) return;
+
+  // 링크 테이블 (전체 표시)
+  const linkTable = buildOTLinks(lastData.mappings || []);
+  if (linkTable) {
+    const title = el('div', {class:'subtle'}, 'Gene → OpenTargets association links:');
+    otLinksDiv.appendChild(title);
+    otLinksDiv.appendChild(linkTable);
+  }
+
+  // gene 단위 페이지네이션
+  const keys = Object.keys(lastData.opentargets || {}).filter(k => !isInvalidGene(k));
+  const { page, total, slice } = paginate(keys, otPage);
+  otPage = page;
+
+  const topn = Number(document.getElementById('topn').value) || 15; // 프런트에서도 topN 강제
+
+  let any = false;
+  const grid = el('div', {class:'grid'});
+  slice.forEach(sym => {
+    const card = el('div', {class:'card'});
+    card.appendChild(el('h3',{},sym));
+    const rows = lastData.opentargets[sym] || [];
+    if (rows.length === 0) {
+      card.appendChild(el('div', {class:'warn'}, `There are no information about "${sym}" in OpenTargets`));
+    } else {
+      const flat = flattenOTRows(rows).slice(0, topn);
+      if (flat.length === 0) {
+        card.appendChild(el('div', {class:'warn'}, `There are no information about "${sym}" in OpenTargets`));
+      } else {
+        any = true;
+        const tbl = tableFrom(flat, [
+          {key:'disease_name', label:'Disease'},
+          {key:'ref',          label:'Reference (DB)'},
+          {key:'score',        label:'Score'}
+        ]);
+        // 점수 포맷팅
+        tbl.querySelectorAll('tbody tr').forEach(tr=>{
+          const td = tr.lastElementChild;
+          const val = parseFloat(td.textContent);
+          if (!Number.isNaN(val)) td.textContent = val.toFixed(3);
+        });
+        card.appendChild(tbl);
+      }
+    }
+    grid.appendChild(card);
+  });
+  if (!any && keys.length===0) grid.appendChild(el('div', {class:'warn'}, 'No OpenTargets rows for given symbols.'));
+  otDiv.appendChild(grid);
+
+  // 하단 페이저
+  const prev = ()=>{ if (otPage>1){ otPage--; renderOT(); } };
+  const next = ()=>{ if (otPage<total){ otPage++; renderOT(); } };
+  renderPager(otPagerBottom, page, total, prev, next);
+}
+
+function renderHZ(){
+  const hzDiv=document.getElementById('hzOut'); hzDiv.innerHTML='';
+  const hzPagerBottom = document.getElementById('hzPagerBottom');
+  hzPagerBottom.innerHTML='';
+
+  if (!lastData || !lastData.harmonizome) return;
+
+  const keys=Object.keys(lastData.harmonizome||{}).filter(k=>!isInvalidGene(k));
+  const {page,total,slice}=paginate(keys,hzPage);
+  hzPage=page;
+
+  const grid = el('div', {class:'grid'});
+  slice.forEach(sym=>{
+    const card=el('div',{class:'card'});
+    card.appendChild(el('h3',{},sym));
+    const rows=lastData.harmonizome[sym]||[];
+    if(rows.length===0){
+      card.appendChild(el('div',{class:'warn'},`There are no information about "${sym}" in CTD`));
+    }else{
+      const mapped=rows.map(r=>({
+        disease:r.term||'',
+        standardized:r.standardized,
+        link:toHarmonizomePageUrl(r.href)
+      }));
+      const tbl=tableFrom(mapped,[
+        {key:'disease',label:'Disease'},
+        {key:'standardized',label:'Score'},
+        {key:'link',label:'Link'}
+      ]);
+      // 링크 셀 하이퍼링크화
+      tbl.querySelectorAll('tbody tr').forEach(tr=>{
+        const td=tr.lastElementChild;
+        const href = td.textContent.trim();
+        td.innerHTML = href ? `<a href="${href}" target="_blank" rel="noopener noreferrer">Harmonizome page</a>` : '';
+      });
+      // 점수 포맷팅
+      tbl.querySelectorAll('tbody tr').forEach(tr=>{
+        const td = tr.children[1];
+        const val = parseFloat(td.textContent);
+        if (!Number.isNaN(val)) td.textContent = val.toPrecision(6);
+      });
+      card.appendChild(tbl);
+    }
+    grid.appendChild(card);
+  });
+  hzDiv.appendChild(grid);
+
+  const prev = ()=>{ if (hzPage>1){ hzPage--; renderHZ(); } };
+  const next = ()=>{ if (hzPage<total){ hzPage++; renderHZ(); } };
+  renderPager(hzPagerBottom, page, total, prev, next);
+}
+
+/* ===== run ===== */
+async function run(){
+  const genes=splitSymbols(document.getElementById('genes').value);
+  const hz=document.getElementById('hzChk').checked;
+  const ot=document.getElementById('otChk').checked;
+  const topn=Number(document.getElementById('topn').value)||15;
+  const disease=document.getElementById('disease').value||null;
+  const match_mode=document.querySelector('input[name="mode"]:checked').value;
+  const status=document.getElementById('status');
+  status.textContent=' Running…';
+  try{
+    const res=await fetch('/api/aggregate',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({symbols:genes,topn,fetch_harmonizome:hz,fetch_opentargets:ot,disease_query:disease,match_mode})
+    });
+    if(!res.ok)throw new Error('HTTP '+res.status);
+    const data=await res.json(); lastData=data;
+
+    // 매핑 표
+    renderMappings(data);
+
+    // 매핑 실패 gene 제외하여 downstream 표시
+    lastData.opentargets=Object.fromEntries(Object.entries(data.opentargets||{}).filter(([k])=>!isInvalidGene(k)));
+    lastData.harmonizome=Object.fromEntries(Object.entries(data.harmonizome||{}).filter(([k])=>!isInvalidGene(k)));
+
+    // 첫 페이지로 초기화 후 렌더
+    otPage=1; hzPage=1;
+    if(ot) renderOT(); else { document.getElementById('otOut').innerHTML=''; document.getElementById('otLinks').innerHTML=''; document.getElementById('otPagerBottom').innerHTML=''; }
+    if(hz) renderHZ(); else { document.getElementById('hzOut').innerHTML=''; document.getElementById('hzPagerBottom').innerHTML=''; }
+
+    status.textContent=' Done';
+  }catch(e){
+    console.error(e);
+    status.textContent=' Error: '+e.message;
+  }
+}
+document.getElementById('run').addEventListener('click',run);
+</script>
+</body>
+</html>
+
