@@ -36,3 +36,8 @@ You can terminate the docker by below command.
 ```
 docker compose -f docker_compose.yml down # Docker 종료
 ```
+
+## Reference
+Diamant I, Clarke DJB, Evangelista JE, Lingam N, Ma'ayan A. Harmonizome 3.0: integrated knowledge about genes and proteins from diverse multi-omics resources. Nucleic Acids Res. 2024 Nov 20. pii: 53(1):D1016-D1028.
+
+Buniello, A. et al. (2025). Open Targets Platform: facilitating therapeutic hypotheses building in drug discovery. Nucleic Acids Research.
