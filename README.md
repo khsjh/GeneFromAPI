@@ -4,7 +4,8 @@ GeneFromAPI is website for gene searching with open API. It used Harmonizome and
 
 
 ## Using the GeneFromAPI `Docker` image
-Now, only docker is available to use GeneFromAPI to avoid something installation.
+Now, only docker is available to use GeneFromAPI.
+If docker is not installed, please install docker at first. Installation commands for docker are written in `docker_install.sh`. When this script is not worked so that docker is not installed, please check the comment of that script. If the recommended command is not work, please install the docker by another way.
 
 Please clone the git repository to your workspace.
 ```
