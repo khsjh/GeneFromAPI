@@ -25,6 +25,11 @@ AME                IMAGE               COMMAND                  SERVICE   CREATE
 gene_explorer_api   gene_explorer-api   "uvicorn main:app --…"   api       55 minutes ago   Up 55 minutes   8000/tcp
 gene_explorer_web   nginx:alpine        "/docker-entrypoint.…"   web       55 minutes ago   Up 49 minutes   0.0.0.0:8080->80/tcp, [::]:8080->80/tcp
 ```
+Now, you can access the GeneFromAPI with your local address
+
+```
+http://localhost:8080
+```
 
 You can terminate the docker by below command.
 ```
