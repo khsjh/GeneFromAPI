@@ -21,22 +21,25 @@
     .subtle{margin:6px 0 0 0; font-size:13px; color:#444}
     .pager{display:flex; align-items:center; gap:8px; margin:8px 0}
     .pager button:disabled{opacity:0.5; cursor:not-allowed}
+    .percent{font-weight:bold; color:#059669}
+    .no-data{color:#999; font-style:italic}
   </style>
 </head>
 <body>
-  <h1>Harmonizome (CTD only) + OpenTargets Gene List Explorer</h1>
+  <h1>Harmonizome (CTD only) + OpenTargets + DrugProtAI Gene List Explorer</h1>
   <p class="muted">Paste HGNC symbols (one per line or comma separated). Back-end: FastAPI.</p>
 
   <div class="row">
     <div class="col">
-      <textarea id="genes" placeholder="SFTPC
+      <textarea id="genes" placeholder="FN1
+SFTPC
 KRT8
-CEBPD
-MGST1"></textarea>
+CEBPD"></textarea>
       <div class="controls">
         <label><input type="checkbox" id="hzChk" checked> Harmonizome (CTD)</label>
         <label><input type="checkbox" id="otChk" checked> OpenTargets</label>
-        <label>Top N (OT): <input type="number" id="topn" value="15" min="1" max="50" style="width:64px"></label>
+        <label><input type="checkbox" id="dpChk" checked> DrugProtAI</label>
+        <label>Top N (OT): <input type="number" id="topn" value="2" min="1" max="50" style="width:64px"></label>
       </div>
       <div class="controls">
         <input id="disease" type="text" placeholder='Disease filter e.g. fibrosis or "fibrosis" (perfect)' />
@@ -51,6 +54,9 @@ MGST1"></textarea>
 
   <h2>Mappings</h2>
   <div id="map"></div>
+
+  <h2>DrugProtAI</h2>
+  <div id="dpOut"></div>
 
   <h2>OpenTargets (Top-N per gene)</h2>
   <div id="otLinks" class="subtle"></div>
@@ -71,7 +77,7 @@ const REF_LABEL = {
   uniprot_variants: 'UniProt variants', uniprot_literature: 'UniProt literature',
   orphanet: 'Orphanet', expression_atlas: 'Expression Atlas',
 };
-/* rows → disease|reference|score 로 평탄화 + 점수 내림차순 */
+
 function flattenOTRows(rows){
   const out = [];
   (rows || []).forEach(r => {
@@ -88,7 +94,7 @@ function flattenOTRows(rows){
   out.sort((a,b) => (b.score ?? -1) - (a.score ?? -1));
   return out;
 }
-/* 매핑으로부터 OT associations 페이지 링크 테이블 생성 */
+
 function buildOTLinks(mappings){
   const rows = (mappings||[])
     .filter(m => m.ensembl_id)
@@ -101,7 +107,6 @@ function buildOTLinks(mappings){
     {key:'gene', label:'Gene'},
     {key:'url',  label:'Link'}
   ]);
-  // 링크 셀 하이퍼링크화
   tbl.querySelectorAll('tbody tr').forEach(tr=>{
     const td = tr.lastElementChild;
     const href = td.textContent.trim();
@@ -191,6 +196,88 @@ function renderMappings(data){
   ]));
 }
 
+function renderDrugProtAI(data){
+  const dpDiv = document.getElementById('dpOut');
+  dpDiv.innerHTML = '';
+  
+  if (!data || !data.drugprotai || Object.keys(data.drugprotai).length === 0) {
+    dpDiv.innerHTML = '<p class="warn">No DrugProtAI data available.</p>';
+    return;
+  }
+
+  // 메인 테이블: Gene, UniProt ID, XGB, RF
+  const mainRows = [];
+  Object.entries(data.drugprotai).forEach(([sym, info]) => {
+    mainRows.push({
+      gene: sym,
+      uniprot_id: info.uniprot_id || '-',
+      xgb: info.druggability_xgb != null ? (info.druggability_xgb * 100).toFixed(2) + '%' : '-',
+      rf: info.druggability_rf != null ? (info.druggability_rf * 100).toFixed(2) + '%' : '-'
+    });
+  });
+
+  const mainTable = tableFrom(mainRows, [
+    {key: 'gene', label: 'Gene Name'},
+    {key: 'uniprot_id', label: 'UniProt ID'},
+    {key: 'xgb', label: 'Druggability – XGB'},
+    {key: 'rf', label: 'Druggability (RF)'}
+  ]);
+  
+  // UniProt ID 링크화
+  mainTable.querySelectorAll('tbody tr').forEach((tr, idx) => {
+    const uniprotCell = tr.children[1];
+    const uniprotId = uniprotCell.textContent.trim();
+    if (uniprotId && uniprotId !== '-') {
+      uniprotCell.innerHTML = `<a href="https://www.uniprot.org/uniprotkb/${uniprotId}" target="_blank" rel="noopener noreferrer">${uniprotId}</a>`;
+    }
+  });
+
+  // XGB, RF 값 색상 강조
+  mainTable.querySelectorAll('tbody tr').forEach(tr => {
+    const xgbCell = tr.children[2];
+    const rfCell = tr.children[3];
+    if (xgbCell.textContent !== '-') xgbCell.classList.add('percent');
+    if (rfCell.textContent !== '-') rfCell.classList.add('percent');
+  });
+
+  dpDiv.appendChild(mainTable);
+
+  // Drug Information 테이블들
+  Object.entries(data.drugprotai).forEach(([sym, info]) => {
+    const drugs = info.existing_drugs || [];
+    if (drugs.length === 0) return;
+
+    const section = el('div', {class: 'drug-section'});
+    section.appendChild(el('h3', {}, `Drug Information — ${sym} (${info.uniprot_id || 'N/A'})`));
+
+    const drugRows = drugs.map(d => ({
+      drug_id: d.drug_id || '',
+      status: d.status || 'unknown',
+      action: d.pharmacological_action || 'unknown',
+      type: d.type || 'unknown'
+    }));
+
+    const drugTable = tableFrom(drugRows, [
+      {key: 'drug_id', label: 'Drug ID'},
+      {key: 'status', label: 'Status'},
+      {key: 'action', label: 'Pharmacological Action'},
+      {key: 'type', label: 'Type'}
+    ]);
+
+    // Drug ID 링크화
+    drugTable.querySelectorAll('tbody tr').forEach(tr => {
+      const drugCell = tr.children[0];
+      const drugId = drugCell.textContent.trim();
+      if (drugId && drugId.startsWith('DB')) {
+        drugCell.innerHTML = `<a href="https://go.drugbank.com/drugs/${drugId}" target="_blank" rel="noopener noreferrer">${drugId}</a>`;
+      }
+    });
+
+    section.appendChild(drugTable);
+    dpDiv.appendChild(section);
+  });
+}
+
 function renderOT(){
   const otDiv = document.getElementById('otOut');
   const otLinksDiv = document.getElementById('otLinks');
@@ -199,7 +286,6 @@ function renderOT(){
 
   if (!lastData || !lastData.opentargets) return;
 
-  // 링크 테이블 (전체 표시)
   const linkTable = buildOTLinks(lastData.mappings || []);
   if (linkTable) {
     const title = el('div', {class:'subtle'}, 'Gene → OpenTargets association links:');
@@ -207,12 +293,11 @@ function renderOT(){
     otLinksDiv.appendChild(linkTable);
   }
 
-  // gene 단위 페이지네이션
   const keys = Object.keys(lastData.opentargets || {}).filter(k => !isInvalidGene(k));
   const { page, total, slice } = paginate(keys, otPage);
   otPage = page;
 
-  const topn = Number(document.getElementById('topn').value) || 15; // 프런트에서도 topN 강제
+  const topn = Number(document.getElementById('topn').value) || 15;
 
   let any = false;
   const grid = el('div', {class:'grid'});
@@ -233,7 +318,6 @@ function renderOT(){
           {key:'ref',          label:'Reference (DB)'},
           {key:'score',        label:'Score'}
         ]);
-        // 점수 포맷팅
         tbl.querySelectorAll('tbody tr').forEach(tr=>{
           const td = tr.lastElementChild;
           const val = parseFloat(td.textContent);
@@ -247,7 +331,6 @@ function renderOT(){
   if (!any && keys.length===0) grid.appendChild(el('div', {class:'warn'}, 'No OpenTargets rows for given symbols.'));
   otDiv.appendChild(grid);
 
-  // 하단 페이저
   const prev = ()=>{ if (otPage>1){ otPage--; renderOT(); } };
   const next = ()=>{ if (otPage<total){ otPage++; renderOT(); } };
   renderPager(otPagerBottom, page, total, prev, next);
@@ -282,13 +365,11 @@ function renderHZ(){
         {key:'standardized',label:'Score'},
         {key:'link',label:'Link'}
       ]);
-      // 링크 셀 하이퍼링크화
       tbl.querySelectorAll('tbody tr').forEach(tr=>{
         const td=tr.lastElementChild;
         const href = td.textContent.trim();
         td.innerHTML = href ? `<a href="${href}" target="_blank" rel="noopener noreferrer">Harmonizome page</a>` : '';
       });
-      // 점수 포맷팅
       tbl.querySelectorAll('tbody tr').forEach(tr=>{
         const td = tr.children[1];
         const val = parseFloat(td.textContent);
@@ -310,6 +391,7 @@ async function run(){
   const genes=splitSymbols(document.getElementById('genes').value);
   const hz=document.getElementById('hzChk').checked;
   const ot=document.getElementById('otChk').checked;
+  const dp=document.getElementById('dpChk').checked;
   const topn=Number(document.getElementById('topn').value)||15;
   const disease=document.getElementById('disease').value||null;
   const match_mode=document.querySelector('input[name="mode"]:checked').value;
@@ -319,22 +401,35 @@ async function run(){
     const res=await fetch('/api/aggregate',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({symbols:genes,topn,fetch_harmonizome:hz,fetch_opentargets:ot,disease_query:disease,match_mode})
+      body:JSON.stringify({
+        symbols:genes,
+        topn,
+        fetch_harmonizome:hz,
+        fetch_opentargets:ot,
+        fetch_drugprotai:dp,
+        disease_query:disease,
+        match_mode
+      })
     });
     if(!res.ok)throw new Error('HTTP '+res.status);
-    const data=await res.json(); lastData=data;
+    const data=await res.json(); 
+    lastData=data;
 
-    // 매핑 표
     renderMappings(data);
 
-    // 매핑 실패 gene 제외하여 downstream 표시
     lastData.opentargets=Object.fromEntries(Object.entries(data.opentargets||{}).filter(([k])=>!isInvalidGene(k)));
     lastData.harmonizome=Object.fromEntries(Object.entries(data.harmonizome||{}).filter(([k])=>!isInvalidGene(k)));
 
-    // 첫 페이지로 초기화 후 렌더
     otPage=1; hzPage=1;
-    if(ot) renderOT(); else { document.getElementById('otOut').innerHTML=''; document.getElementById('otLinks').innerHTML=''; document.getElementById('otPagerBottom').innerHTML=''; }
-    if(hz) renderHZ(); else { document.getElementById('hzOut').innerHTML=''; document.getElementById('hzPagerBottom').innerHTML=''; }
+    
+    if(dp) renderDrugProtAI(data); 
+    else document.getElementById('dpOut').innerHTML='';
+    
+    if(ot) renderOT(); 
+    else { document.getElementById('otOut').innerHTML=''; document.getElementById('otLinks').innerHTML=''; document.getElementById('otPagerBottom').innerHTML=''; }
+    
+    if(hz) renderHZ(); 
+    else { document.getElementById('hzOut').innerHTML=''; document.getElementById('hzPagerBottom').innerHTML=''; }
 
     status.textContent=' Done';
   }catch(e){
@@ -346,4 +441,3 @@ document.getElementById('run').addEventListener('click',run);
 </script>
 </body>
 </html>
-

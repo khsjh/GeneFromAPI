@@ -1,4 +1,4 @@
-version: "1.0.0"
+version: "3.9"
 
 services:
   api:
@@ -10,7 +10,16 @@ services:
       - "8000"
     environment:
       - GUNICORN_CMD_ARGS=--timeout 120
-      - DEBUG_SCRAPER=1
+      - DRUGPROTAI_HOME=https://drugprotai.pythonanywhere.com/
+      - SCRAPER_USER_AGENT="GeneFromAPI/1.5 (contact=https://github.com/khsjh/GeneFromAPI)"
+      - SCRAPER_MIN_INTERVAL_SEC=1.0
+      - SCRAPER_CACHE_TTL_SEC=86400
+      - SCRAPER_CACHE_DIR=/cache/drugprotai
+      - PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+      - XDG_CACHE_HOME=/ms-playwright
+    volumes:
+      - ./cache:/cache
+    shm_size: "1gb"
     restart: unless-stopped
 
   web:

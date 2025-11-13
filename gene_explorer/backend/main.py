@@ -1,5 +1,5 @@
 # =========================
-# backend/main.py
+# backend/main.py (with DrugProtAI)
 # =========================
 # Run: uvicorn main:app --reload --host 127.0.0.1 --port 8000
 
@@ -12,27 +12,47 @@ import urllib.parse
 import asyncio
 import os
 import re
+import json
+import time
+import hashlib
+from pathlib import Path
 from pydantic import BaseModel
+from playwright.async_api import async_playwright
 
 # ---- Tunables (env overrides allowed) ----
-DEFAULT_TIMEOUT = float(os.getenv("GLE_DEFAULT_TIMEOUT", "20.0"))    # 기본 httpx 타임아웃
-HZ_TIMEOUT      = float(os.getenv("GLE_HZ_TIMEOUT", "80.0"))         # Harmonizome 전용 타임아웃
-OT_TIMEOUT      = float(os.getenv("GLE_OT_TIMEOUT", "25.0"))         # OpenTargets 전용 타임아웃
-RETRIES         = int(os.getenv("GLE_RETRIES", "3"))                 # 재시도 횟수
+DEFAULT_TIMEOUT = float(os.getenv("GLE_DEFAULT_TIMEOUT", "20.0"))
+HZ_TIMEOUT      = float(os.getenv("GLE_HZ_TIMEOUT", "80.0"))
+OT_TIMEOUT      = float(os.getenv("GLE_OT_TIMEOUT", "25.0"))
+RETRIES         = int(os.getenv("GLE_RETRIES", "3"))
+
+# DrugProtAI settings
+DRUGPROTAI_HOME = "https://drugprotai.pythonanywhere.com/"
+SCRAPER_MIN_INTERVAL = 0.8  # rate limit (초)
+SCRAPER_CACHE_TTL = 24 * 3600  # 1일
+SCRAPER_CACHE_DIR = Path(os.getenv("SCRAPER_CACHE_DIR", "/tmp/drugprotai_cache"))
+DRUGPROTAI_TIMEOUT = 90.0
+
+# 캐시 디렉토리 생성은 앱 시작 시점으로 지연
 
 ENSEMBL_LOOKUP   = "https://rest.ensembl.org/lookup/symbol/homo_sapiens/"
+UNIPROT_BASE     = "https://rest.uniprot.org"
 HARMONIZOME_BASE = "https://maayanlab.cloud/Harmonizome/api/1.0/gene/"
 OPENTARGETS_GQL  = "https://api.platform.opentargets.org/api/v4/graphql"
-USER_AGENT = "GeneListExplorerFastAPI/1.4"
+USER_AGENT = "GeneListExplorerFastAPI/1.5"
 
-# ---- Request model (질환 필터 추가) ----
+# Global state
+_last_scrape_ts = 0.0
+_drugprotai_sem = asyncio.Semaphore(1)  # 동시 실행 제한
+
+# ---- Request model ----
 class AggregateRequest(BaseModel):
     symbols: List[str]
     topn: Optional[int] = 15
     fetch_harmonizome: bool = True
     fetch_opentargets: bool = True
-    disease_query: Optional[str] = None     # 질환 검색어
-    match_mode: Optional[str] = "auto"      # "auto" | "simple" | "exact"
+    fetch_drugprotai: bool = True
+    disease_query: Optional[str] = None
+    match_mode: Optional[str] = "auto"  # "auto" | "simple" | "exact"
 
 # ---------------- HTTP helper ----------------
 class HttpJson:
@@ -88,6 +108,13 @@ app.add_middleware(
     allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
+# 캐시 디렉토리 생성 (앱 초기화 시점)
+try:
+    SCRAPER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"Cache directory created: {SCRAPER_CACHE_DIR}")
+except Exception as e:
+    print(f"Warning: Could not create cache directory {SCRAPER_CACHE_DIR}: {e}")
+
 # ---------------- utils ----------------
 def clean_symbols(symbols: List[str]) -> List[str]:
     seen, out = set(), []
@@ -108,7 +135,6 @@ def _is_exact_mode(query: Optional[str], mode: str) -> bool:
         return True
     if mode == "simple":
         return False
-    # auto: 따옴표로 감싸져 있으면 exact
     q = query.strip()
     return (q.startswith('"') and q.endswith('"')) or (q.startswith("'") and q.endswith("'"))
 
@@ -120,14 +146,16 @@ def _match_text(name: str, query: str, mode: str) -> bool:
     q_l = (_normalize_quotes(query) if _is_exact_mode(query, mode) else query).lower()
     if _is_exact_mode(query, mode):
         return name_l == q_l
-    # simple: 단순 부분매치 + 단어경계 우선
-    # 단어경계 시도
     try:
         if re.search(rf"\b{re.escape(q_l)}\b", name_l):
             return True
     except re.error:
         pass
     return q_l in name_l
+
+def _cache_key(key: str) -> Path:
+    """캐시 파일 경로 생성"""
+    return SCRAPER_CACHE_DIR / (hashlib.sha1(key.encode("utf-8")).hexdigest() + ".json")
 
 # ---------------- external fetchers ----------------
 async def map_symbol_to_ensembl(sym: str) -> Dict[str, Optional[str]]:
@@ -139,13 +167,26 @@ async def map_symbol_to_ensembl(sym: str) -> Dict[str, Optional[str]]:
         print("Ensembl error:", repr(e))
         return {"symbol": sym, "ensembl_id": None, "matched_symbol": None}
 
-# Harmonizome: CTD만 사용 + disease_query 매칭 (순수 질환명으로 매칭)
+async def fetch_uniprot_id(sym: str) -> Dict[str, Optional[str]]:
+    """Gene symbol -> UniProt ID 변환"""
+    q = f"(gene_exact:{sym}) AND (organism_id:9606) AND (reviewed:true)"
+    url = f"{UNIPROT_BASE}/uniprotkb/search?query={urllib.parse.quote(q)}&fields=accession,reviewed,organism_id&format=json&size=1"
+    try:
+        j = await http.get(url)
+        if j.get("results"):
+            return {"symbol": sym, "uniprot_id": j["results"][0]["primaryAccession"]}
+        # fallback
+        q2 = f"(gene:{sym}) AND (organism_id:9606) AND (reviewed:true)"
+        url2 = f"{UNIPROT_BASE}/uniprotkb/search?query={urllib.parse.quote(q2)}&fields=accession&format=json&size=1"
+        j2 = await http.get(url2)
+        if j2.get("results"):
+            return {"symbol": sym, "uniprot_id": j2["results"][0]["primaryAccession"]}
+    except Exception as e:
+        print("UniProt error:", repr(e))
+    return {"symbol": sym, "uniprot_id": None}
+
+# Harmonizome: CTD만 사용 + disease_query 매칭
 async def fetch_harmonizome(symbol: str, disease_query: Optional[str], match_mode: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    """
-    Returns (rows, error_message)
-    For CTD Gene-Disease Associations only.
-    rows: [{symbol, term, href, threshold, standardized}, ...]
-    """
     url = f"{HARMONIZOME_BASE}{urllib.parse.quote(symbol, safe='')}?showAssociations=true"
     CTD_TOKEN = "CTD+Gene-Disease+Associations"
     try:
@@ -156,26 +197,20 @@ async def fetch_harmonizome(symbol: str, disease_query: Optional[str], match_mod
             gs = (a or {}).get("geneSet") or {}
             href = gs.get("href") or ""
             name = gs.get("name") or ""
-            # 1) CTD만 통과 (href에 토큰 포함)
             if CTD_TOKEN not in href:
                 continue
-            # 2) CTD name → 순수 질환명으로 정규화
-            #    예: "Fibrosis/CTD Gene-Disease Associations" → "Fibrosis"
             pure_term = name.split("/CTD Gene-Disease Associations")[0].strip() or name.strip()
-            # 3) 질환 필터 적용 (있을 때만)
             if disease_query and not _match_text(pure_term, disease_query, match_mode):
                 continue
-            # 4) 절대 URL 보정
             if href.startswith("/"):
                 href = "https://maayanlab.cloud" + href
             out.append({
                 "symbol": j.get("symbol", symbol),
-                "term": pure_term,  # 화면 표시는 순수 질환명
+                "term": pure_term,
                 "href": href,
                 "threshold": a.get("thresholdValue"),
                 "standardized": a.get("standardizedValue"),
             })
-        # 점수 높은 순 정렬
         out.sort(key=lambda x: (x.get("standardized") is not None, x.get("standardized") or -1), reverse=True)
         return out, None
     except Exception as e:
@@ -211,7 +246,6 @@ async def fetch_opentargets_assocs(ensembl_id: str, disease_query: Optional[str]
             for r in rows:
                 disease = (r.get("disease") or {})
                 dname = disease.get("name") or ""
-                # 질환 필터 (있으면 적용)
                 if disease_query and not _match_text(dname, disease_query, match_mode):
                     continue
                 out.append({
@@ -232,11 +266,210 @@ async def fetch_opentargets_assocs(ensembl_id: str, disease_query: Optional[str]
         print(msg)
         return [], msg
 
+# ---------------- DrugProtAI (Playwright) ----------------
+async def _scrape_drugprotai(uniprot_id: str) -> Dict[str, Any]:
+    """
+    DrugProtAI 사이트에서 정보 추출
+    1. UniProt ID 입력
+    2. Alert 팝업 처리
+    3. SHOW DRUGGABILITY INDEX -> XGB, RF 값 추출
+    4. EXISTING DRUGS 정보 추출
+    """
+    global _last_scrape_ts
+    
+    # 캐시 확인
+    ck = _cache_key(f"PW::{uniprot_id}")
+    if ck.exists() and (time.time() - ck.stat().st_mtime) < SCRAPER_CACHE_TTL:
+        try:
+            print(f"✓ Cache hit for {uniprot_id}")
+            return json.loads(ck.read_text("utf-8"))
+        except Exception:
+            pass
+    
+    # Rate limit
+    wait = SCRAPER_MIN_INTERVAL - (time.time() - _last_scrape_ts)
+    if wait > 0:
+        await asyncio.sleep(wait)
+    
+    data: Dict[str, Any] = {
+        "druggability": {"xgboost": None, "random_forest": None},
+        "existing_drugs": []
+    }
+    
+    browser = context = page = None
+    try:
+        async with async_playwright() as p:
+            print(f"→ Scraping {uniprot_id}...")
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"]
+            )
+            context = await browser.new_context(
+                user_agent=USER_AGENT,
+                viewport={"width": 1920, "height": 1080}
+            )
+            page = await context.new_page()
+            
+            # Alert 자동 수락 핸들러 등록
+            page.on("dialog", lambda dialog: asyncio.create_task(dialog.accept()))
+            
+            # 1. 사이트 접속
+            await page.goto(DRUGPROTAI_HOME, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(2000)
+            
+            # 2. UniProt ID 입력
+            input_box = page.locator("input[type='text']").first
+            await input_box.wait_for(state="visible", timeout=10000)
+            await input_box.fill(uniprot_id)
+            await page.keyboard.press("Enter")
+            await page.wait_for_timeout(4000)
+            
+            # 3. SHOW DRUGGABILITY INDEX 버튼 클릭
+            try:
+                show_btn = page.locator("#show-third-section")
+                await show_btn.wait_for(state="visible", timeout=10000)
+                await show_btn.evaluate("el => el.click()")
+                await page.wait_for_timeout(2000)
+                print("  ✓ Druggability section opened")
+            except Exception as e:
+                print(f"  ✗ Failed to open druggability section: {e}")
+            
+            # 4. XGB 값 읽기 (기본값)
+            try:
+                di_elem = page.locator("#druggability-index")
+                await di_elem.wait_for(state="visible", timeout=5000)
+                
+                # 애니메이션 안정화 대기 (연속 3번 동일값)
+                last_val = None
+                stable_count = 0
+                for _ in range(12):
+                    text = await di_elem.inner_text()
+                    text = text.replace("%", "").replace(",", "").strip()
+                    try:
+                        current = float(text)
+                        if last_val is not None and abs(current - last_val) < 0.01:
+                            stable_count += 1
+                            if stable_count >= 3:
+                                data["druggability"]["xgboost"] = current / 100.0
+                                print(f"  ✓ XGB: {current}%")
+                                break
+                        else:
+                            stable_count = 0
+                        last_val = current
+                    except ValueError:
+                        pass
+                    await page.wait_for_timeout(250)
+            except Exception as e:
+                print(f"  ✗ XGB read failed: {e}")
+            
+            # 5. RF 버튼 클릭 후 값 읽기
+            try:
+                rf_btn = page.locator("#rf-button")
+                await rf_btn.wait_for(state="visible", timeout=5000)
+                await rf_btn.evaluate("el => el.click()")
+                await page.wait_for_timeout(1500)
+                
+                # RF 값 안정화 대기
+                last_val = None
+                stable_count = 0
+                for _ in range(12):
+                    text = await di_elem.inner_text()
+                    text = text.replace("%", "").replace(",", "").strip()
+                    try:
+                        current = float(text)
+                        if last_val is not None and abs(current - last_val) < 0.01:
+                            stable_count += 1
+                            if stable_count >= 3:
+                                data["druggability"]["random_forest"] = current / 100.0
+                                print(f"  ✓ RF: {current}%")
+                                break
+                        else:
+                            stable_count = 0
+                        last_val = current
+                    except ValueError:
+                        pass
+                    await page.wait_for_timeout(250)
+            except Exception as e:
+                print(f"  ✗ RF read failed: {e}")
+            
+            # 6. EXISTING DRUGS 버튼 클릭
+            try:
+                drug_btn = page.locator("#view-drug-info-btn")
+                await drug_btn.wait_for(state="visible", timeout=5000)
+                await drug_btn.evaluate("el => el.click()")
+                await page.wait_for_timeout(2000)
+                print("  ✓ Drug info opened")
+                
+                # 테이블에서 약물 정보 추출
+                table = page.locator("table").first
+                await table.wait_for(state="visible", timeout=5000)
+                rows = await table.locator("tbody tr").all()
+                
+                for row in rows:
+                    cells = await row.locator("td").all_inner_texts()
+                    if len(cells) >= 4:
+                        # 헤더 행 제외
+                        if cells[0].lower().strip() == "drug id":
+                            continue
+                        
+                        data["existing_drugs"].append({
+                            "drug_id": cells[0].strip(),
+                            "status": cells[1].strip(),
+                            "pharmacological_action": cells[2].strip(),
+                            "type": cells[3].strip()
+                        })
+                
+                print(f"  ✓ Found {len(data['existing_drugs'])} drugs")
+            except Exception as e:
+                print(f"  ✗ Drug info failed: {e}")
+    
+    except Exception as e:
+        print(f"✗ Scraping error for {uniprot_id}: {repr(e)}")
+    
+    finally:
+        if context:
+            try:
+                await context.close()
+            except Exception:
+                pass
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+    
+    _last_scrape_ts = time.time()
+    
+    # 유효한 결과만 캐시
+    if data["druggability"]["xgboost"] or data["druggability"]["random_forest"] or data["existing_drugs"]:
+        try:
+            ck.write_text(json.dumps(data, ensure_ascii=False), "utf-8")
+            print(f"  ✓ Cached")
+        except Exception:
+            pass
+    
+    return data
+
+async def fetch_drugprotai(uniprot_id: str) -> Dict[str, Any]:
+    """DrugProtAI 데이터 가져오기 (세마포어로 동시 실행 제한)"""
+    if not uniprot_id:
+        return {}
+    
+    async with _drugprotai_sem:
+        try:
+            return await asyncio.wait_for(_scrape_drugprotai(uniprot_id), timeout=DRUGPROTAI_TIMEOUT)
+        except asyncio.TimeoutError:
+            print(f"✗ Timeout for {uniprot_id}")
+            return {}
+        except Exception as e:
+            print(f"✗ Error for {uniprot_id}: {repr(e)}")
+            return {}
+
 # ---------------- routes ----------------
 @app.get("/", response_class=HTMLResponse)
 async def root():
     return """<html><body>
-    <h2>Gene List Explorer API</h2>
+    <h2>Gene List Explorer API (with DrugProtAI)</h2>
     <p>Use <code>POST /aggregate</code> with JSON payload.<br>
     See <a href="/docs">/docs</a> or <a href="/redoc">/redoc</a>.</p>
     </body></html>"""
@@ -255,18 +488,30 @@ async def debug_ot(ensembl_id: str, disease_query: Optional[str] = None, match_m
     rows, err = await fetch_opentargets_assocs(ensembl_id, disease_query, match_mode)
     return {"rows": rows, "error": err}
 
+@app.get("/debug/drugprotai", response_class=JSONResponse)
+async def debug_drugprotai(uniprot_id: str):
+    data = await fetch_drugprotai(uniprot_id)
+    return data
+
 @app.post("/aggregate", response_class=JSONResponse)
 async def aggregate(req: AggregateRequest):
     symbols = clean_symbols(req.symbols)
     if not symbols:
         raise HTTPException(status_code=400, detail="No valid symbols provided")
 
-    # 1) map symbols -> Ensembl IDs in parallel
-    mappings = await asyncio.gather(*[map_symbol_to_ensembl(s) for s in symbols])
+    print(f"\n{'='*60}")
+    print(f"Processing {len(symbols)} symbols")
+    print(f"{'='*60}")
 
-    # 2) per gene tasks (CTD only + disease filter)
+    # 1) map symbols -> Ensembl IDs & UniProt IDs in parallel
+    ensembl_maps, uniprot_maps = await asyncio.gather(
+        asyncio.gather(*[map_symbol_to_ensembl(s) for s in symbols]),
+        asyncio.gather(*[fetch_uniprot_id(s) for s in symbols]),
+    )
+
+    # 2) per gene tasks (Harmonizome + OpenTargets)
     tasks = []
-    for m in mappings:
+    for m in ensembl_maps:
         sym = m["symbol"]
         if req.fetch_harmonizome:
             tasks.append(fetch_harmonizome(sym, req.disease_query, req.match_mode or "auto"))
@@ -282,7 +527,7 @@ async def aggregate(req: AggregateRequest):
     ot_err: Dict[str, Optional[str]] = {}
 
     r_idx = 0
-    for m in mappings:
+    for m in ensembl_maps:
         sym = m["symbol"]
         if req.fetch_harmonizome:
             rows, err = results[r_idx]; r_idx += 1
@@ -291,6 +536,37 @@ async def aggregate(req: AggregateRequest):
             rows, err = results[r_idx]; r_idx += 1
             ot[sym] = rows; ot_err[sym] = err
 
+    # 3) DrugProtAI (순차 실행)
+    dp: Dict[str, Dict[str, Any]] = {}
+    dp_err: Dict[str, Optional[str]] = {}
+    
+    if req.fetch_drugprotai:
+        print(f"\nFetching DrugProtAI data...")
+        for uniprot_map in uniprot_maps:
+            sym = uniprot_map["symbol"]
+            uid = uniprot_map.get("uniprot_id")
+            
+            if not uid:
+                dp[sym] = {
+                    "uniprot_id": None,
+                    "druggability_xgb": None,
+                    "druggability_rf": None,
+                    "existing_drugs": []
+                }
+                dp_err[sym] = "No UniProt ID found"
+                continue
+            
+            data = await fetch_drugprotai(uid)
+            dg = data.get("druggability", {})
+            
+            dp[sym] = {
+                "uniprot_id": uid,
+                "druggability_xgb": dg.get("xgboost"),
+                "druggability_rf": dg.get("random_forest"),
+                "existing_drugs": data.get("existing_drugs", [])
+            }
+            dp_err[sym] = None
+
     # Top-N per gene (OpenTargets)
     topn = max(1, req.topn or 15)
     ot_top: Dict[str, List[Dict[str, Any]]] = {}
@@ -298,12 +574,16 @@ async def aggregate(req: AggregateRequest):
         rows_sorted = sorted(rows, key=lambda x: (x.get("score") is not None, x.get("score") or -1), reverse=True)
         ot_top[sym] = rows_sorted[:topn]
 
+    print(f"{'='*60}\n")
+
     return {
-        "mappings": mappings,
+        "mappings": ensembl_maps,
+        "uniprot_mappings": uniprot_maps,
         "harmonizome": hz,
         "harmonizome_errors": hz_err,
         "opentargets": ot,
         "opentargets_errors": ot_err,
         "opentargets_top": ot_top,
+        "drugprotai": dp,
+        "drugprotai_errors": dp_err,
     }
-

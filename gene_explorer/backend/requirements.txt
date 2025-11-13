@@ -3,3 +3,6 @@ uvicorn[standard]==0.38.0
 httpx[http2]==0.28.1
 orjson==3.11.4
 pydantic==2.10.3
+beautifulsoup4==4.14.2
+lxml==6.0.2
+playwright==1.56.0
