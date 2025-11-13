@@ -1,0 +1,5 @@
+docker compose -f docker_compose.yml ps
+docker compose -f docker_compose.yml up
+docker compose -f docker_compose.yml down
+http://localhost:8080
+
