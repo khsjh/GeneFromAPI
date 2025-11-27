@@ -20,9 +20,9 @@ from pydantic import BaseModel
 from playwright.async_api import async_playwright
 
 # ---- Tunables (env overrides allowed) ----
-DEFAULT_TIMEOUT = float(os.getenv("GLE_DEFAULT_TIMEOUT", "20.0"))
+DEFAULT_TIMEOUT = float(os.getenv("GLE_DEFAULT_TIMEOUT", "80.0"))
 HZ_TIMEOUT      = float(os.getenv("GLE_HZ_TIMEOUT", "80.0"))
-OT_TIMEOUT      = float(os.getenv("GLE_OT_TIMEOUT", "25.0"))
+OT_TIMEOUT      = float(os.getenv("GLE_OT_TIMEOUT", "80.0"))
 RETRIES         = int(os.getenv("GLE_RETRIES", "3"))
 
 # DrugProtAI settings
@@ -30,7 +30,7 @@ DRUGPROTAI_HOME = "https://drugprotai.pythonanywhere.com/"
 SCRAPER_MIN_INTERVAL = 0.8  # rate limit (초)
 SCRAPER_CACHE_TTL = 24 * 3600  # 1일
 SCRAPER_CACHE_DIR = Path(os.getenv("SCRAPER_CACHE_DIR", "/tmp/drugprotai_cache"))
-DRUGPROTAI_TIMEOUT = 90.0
+DRUGPROTAI_TIMEOUT = 240.0
 
 # 캐시 디렉토리 생성은 앱 시작 시점으로 지연
 
@@ -70,15 +70,48 @@ class HttpJson:
             try:
                 r = await self.client.get(url, timeout=timeout)
                 r.raise_for_status()
+
+                # 1차: 정상 JSON이라고 가정
                 try:
                     return r.json()
                 except Exception:
-                    text = (r.text or "")[:200]
-                    raise RuntimeError(f"Non-JSON response from GET {url}: {text}")
+                    # Harmonizome처럼 "JSON + 기타 텍스트"가 섞인 경우 대비
+                    text = r.text or ""
+
+                    # 본문에서 가장 바깥쪽 { ... } 구간만 추출해서 다시 파싱
+                    start = text.find("{")
+                    end = text.rfind("}")
+                    if start != -1 and end != -1 and end > start:
+                        candidate = text[start:end + 1]
+                        try:
+                            return json.loads(candidate)
+                        except Exception:
+                            pass  # 아래에서 에러로 떨어짐
+
+                    short = text[:200]
+                    raise RuntimeError(
+                        f"Non-JSON response from GET {url}: {short}"
+                    )
+
             except Exception:
                 if attempt == RETRIES - 1:
                     raise
                 await asyncio.sleep(0.5 * (attempt + 1))
+
+#    async def get(self, url: str, timeout: Optional[float] = None) -> Any:
+#        for attempt in range(RETRIES):
+#            try:
+#                r = await self.client.get(url, timeout=timeout)
+#                r.raise_for_status()
+#                try:
+#                    return r.json()
+#                except Exception:
+#                    text = (r.text or "")[:200]
+#                    raise RuntimeError(f"Non-JSON response from GET {url}: {text}")
+#            except Exception:
+#                if attempt == RETRIES - 1:
+#                    raise
+#                await asyncio.sleep(0.5 * (attempt + 1))
 
     async def post_json(self, url: str, body: Dict[str, Any], timeout: Optional[float] = None) -> Any:
         for attempt in range(RETRIES):

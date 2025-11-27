@@ -23,6 +23,10 @@
     .pager button:disabled{opacity:0.5; cursor:not-allowed}
     .percent{font-weight:bold; color:#059669}
     .no-data{color:#999; font-style:italic}
+    .table-wrapper {margin-top: 8px; text-align: right;}
+    .table-wrapper table {margin-top: 4px;}
+    .csv-btn {display: inline-block; font-size: 11px; padding: 2px 6px; border: 1px solid #ddd; background: #f9fafb; border-radius: 3px; cursor: pointer;}
+    .csv-btn:hover {background: #e5e7eb;}
   </style>
 </head>
 <body>
@@ -106,7 +110,7 @@ function buildOTLinks(mappings){
   const tbl = tableFrom(rows, [
     {key:'gene', label:'Gene'},
     {key:'url',  label:'Link'}
-  ]);
+  ], { filename: 'OpenTargets_links.csv' });
   tbl.querySelectorAll('tbody tr').forEach(tr=>{
     const td = tr.lastElementChild;
     const href = td.textContent.trim();
@@ -131,21 +135,43 @@ function el(tag, attrs={}, children=[]) {
   });
   return node;
 }
-function tableFrom(rows, columns){
+
+function tableFrom(rows, columns, options) {
+  options = options || {};
+
+  // wrapper: 테이블 + csv 버튼
+  const wrapper = el('div', { class: 'table-wrapper' });
+
+  // 실제 테이블 생성
   const tbl = el('table');
   const thead = el('thead');
   const trh = el('tr');
-  columns.forEach(c=> trh.appendChild(el('th',{},c.label)));
-  thead.appendChild(trh); tbl.appendChild(thead);
+  (columns || []).forEach(c => trh.appendChild(el('th', {}, c.label)));
+  thead.appendChild(trh);
+  tbl.appendChild(thead);
+
   const tbody = el('tbody');
-  rows.forEach(r=>{
+  (rows || []).forEach(r => {
     const tr = el('tr');
-    columns.forEach(c=> tr.appendChild(el('td',{}, String((r||{})[c.key] ?? ''))));
+    (columns || []).forEach(c => {
+      tr.appendChild(el('td', {}, String((r || {})[c.key] ?? '')));
+    });
     tbody.appendChild(tr);
   });
   tbl.appendChild(tbody);
-  return tbl;
+
+  // csv 버튼 생성
+  const csvBtn = el('button', { type: 'button', class: 'csv-btn' }, 'csv');
+  csvBtn.addEventListener('click', () => {
+    downloadTableAsCSV(tbl, options.filename || 'table.csv');
+  });
+
+  wrapper.appendChild(csvBtn);
+  wrapper.appendChild(tbl);
+  return wrapper;
 }
+
+
 function renderPager(container, page, total, onPrev, onNext){
   container.innerHTML = '';
   const prev = el('button',{type:'button'},'Prev');
@@ -177,6 +203,37 @@ function isInvalidGene(sym){
   const m=(lastData?.mappings||[]).find(x=>x.symbol===sym);
   return !m || !m.ensembl_id;
 }
+function downloadTableAsCSV(table, filename) {
+  const rows = table.querySelectorAll('tr');
+  const csvLines = [];
+
+  rows.forEach(tr => {
+    const cells = tr.querySelectorAll('th, td');
+    const row = [];
+    cells.forEach(cell => {
+      let text = (cell.textContent || '').replace(/\r?\n|\r/g, ' ').trim();
+      // 쉼표나 따옴표가 포함된 경우 CSV 규격에 맞게 이스케이프
+      if (text.includes('"')) {
+        text = text.replace(/"/g, '""');
+      }
+      if (text.includes(',') || text.includes('"')) {
+        text = `"${text}"`;
+      }
+      row.push(text);
+    });
+    csvLines.push(row.join(','));
+  });
+
+  const blob = new Blob([csvLines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename || 'table.csv';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 500);
+}
 
 /* ===== renderers ===== */
 function renderMappings(data){
@@ -193,7 +250,7 @@ function renderMappings(data){
     {key:'symbol',label:'Symbol'},
     {key:'matched_symbol',label:'Matched'},
     {key:'ensembl_id',label:'Ensembl ID'}
-  ]));
+  ], { filename: 'Mappings_results.csv' }));
 }
 
 function renderDrugProtAI(data){
@@ -221,7 +278,7 @@ function renderDrugProtAI(data){
     {key: 'uniprot_id', label: 'UniProt ID'},
     {key: 'xgb', label: 'Druggability – XGB'},
     {key: 'rf', label: 'Druggability (RF)'}
-  ]);
+  ], { filename: 'DrugProtAI_results.csv' });
   
   // UniProt ID 링크화
   mainTable.querySelectorAll('tbody tr').forEach((tr, idx) => {
@@ -262,7 +319,7 @@ function renderDrugProtAI(data){
       {key: 'status', label: 'Status'},
       {key: 'action', label: 'Pharmacological Action'},
       {key: 'type', label: 'Type'}
-    ]);
+    ], { filename: `DrugProtAI_drugs_${sym}.csv` });
 
     // Drug ID 링크화
     drugTable.querySelectorAll('tbody tr').forEach(tr => {
@@ -317,7 +374,7 @@ function renderOT(){
           {key:'disease_name', label:'Disease'},
           {key:'ref',          label:'Reference (DB)'},
           {key:'score',        label:'Score'}
-        ]);
+        ], { filename: `OpenTargets_results_${sym}.csv` });
         tbl.querySelectorAll('tbody tr').forEach(tr=>{
           const td = tr.lastElementChild;
           const val = parseFloat(td.textContent);
@@ -364,7 +421,7 @@ function renderHZ(){
         {key:'disease',label:'Disease'},
         {key:'standardized',label:'Score'},
         {key:'link',label:'Link'}
-      ]);
+      ], { filename: `Harmonizome_CTD_results_${sym}.csv` });
       tbl.querySelectorAll('tbody tr').forEach(tr=>{
         const td=tr.lastElementChild;
         const href = td.textContent.trim();
