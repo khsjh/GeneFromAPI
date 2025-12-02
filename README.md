@@ -14,12 +14,12 @@ git clone https://github.com/khsjh/GeneFromAPI.git
 
 And build docker with `gene_explorer` directory
 ```
-docker compose -f docker_compose.yml up -d --build # Docker build
+docker compose -f docker_compose.yml up -d --build # Build the docker imange and generate container
 ```
 
 You can check whether docker is built successfully. If "UP" is displayed in the `STATUS` column, the work is done.
 ```
-docker compose -f docker_compose.yml ps # 확인용
+docker compose -f docker_compose.yml ps # Check docker status
 
 # output
 AME                IMAGE               COMMAND                  SERVICE   CREATED          STATUS          PORTS
@@ -34,7 +34,7 @@ http://localhost:8080
 
 You can terminate the docker by below command.
 ```
-docker compose -f docker_compose.yml down # Docker 종료
+docker compose -f docker_compose.yml down # Delete docker container
 ```
 
 ## Reference
