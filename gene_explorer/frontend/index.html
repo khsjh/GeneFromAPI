@@ -43,6 +43,7 @@ CEBPD"></textarea>
         <label><input type="checkbox" id="hzChk" checked> Harmonizome (CTD)</label>
         <label><input type="checkbox" id="otChk" checked> OpenTargets</label>
         <label><input type="checkbox" id="dpChk" checked> DrugProtAI</label>
+	<label><input type="checkbox" id="dtChk" checked> DrugTar</label>
         <label>Top N (OT): <input type="number" id="topn" value="2" min="1" max="50" style="width:64px"></label>
       </div>
       <div class="controls">
@@ -61,6 +62,9 @@ CEBPD"></textarea>
 
   <h2>DrugProtAI</h2>
   <div id="dpOut"></div>
+
+  <h2>DrugTar</h2>
+  <div id="drugtarOut"></div>
 
   <h2>OpenTargets (Top-N per gene)</h2>
   <div id="otLinks" class="subtle"></div>
@@ -239,18 +243,48 @@ function downloadTableAsCSV(table, filename) {
 function renderMappings(data){
   const mapDiv=document.getElementById('map');
   mapDiv.innerHTML='';
-  const tableData=(data.mappings||[]).map(m=>{
-    if(!m.ensembl_id){
-      return {symbol:m.symbol,matched_symbol:`There are no named "${m.symbol}"`,ensembl_id:''};
-    }else{
-      return {symbol:m.symbol,matched_symbol:m.matched_symbol||'',ensembl_id:m.ensembl_id||''};
+  const uniIndex = {};
+  (data.uniprot_mappings || []).forEach(m => {
+    if (!m) return;
+    uniIndex[m.symbol] = m.uniprot_id || '';
+  });
+
+  const tableData = (data.mappings || []).map(m => {
+    const uniprot = uniIndex[m.symbol] || '';
+    if (!m.ensembl_id) {
+      return {
+        symbol: m.symbol,
+        matched_symbol: `There are no named "${m.symbol}"`,
+        ensembl_id: '',
+        uniprot_id: uniprot,
+      };
+    } else {
+      return {
+        symbol: m.symbol,
+        matched_symbol: m.matched_symbol || '',
+        ensembl_id: m.ensembl_id || '',
+        uniprot_id: uniprot,
+      };
     }
   });
-  mapDiv.appendChild(tableFrom(tableData,[
-    {key:'symbol',label:'Symbol'},
-    {key:'matched_symbol',label:'Matched'},
-    {key:'ensembl_id',label:'Ensembl ID'}
-  ], { filename: 'Mappings_results.csv' }));
+  
+  const tbl = tableFrom(tableData, [
+    { key: 'symbol',        label: 'Symbol' },
+    { key: 'matched_symbol',label: 'Matched' },
+    { key: 'ensembl_id',    label: 'Ensembl ID' },
+    { key: 'uniprot_id',    label: 'UniProt ID' },   // NEW
+  ], { filename: 'Mappings_results.csv' });
+
+  tbl.querySelectorAll('tbody tr').forEach(tr => {
+    const uniCell = tr.children[3];
+    const uid = uniCell.textContent.trim();
+    if (uid) {
+      uniCell.innerHTML =
+        `<a href="https://www.uniprot.org/uniprotkb/${uid}" target="_blank" rel="noopener noreferrer">${uid}</a>`;
+    }
+  });
+
+  mapDiv.appendChild(tbl);
 }
 
 function renderDrugProtAI(data){
@@ -443,12 +477,78 @@ function renderHZ(){
   renderPager(hzPagerBottom, page, total, prev, next);
 }
 
+// DrugTar 결과를 렌더링: DrugTar 웹 UI의 테이블 구조를 그대로 사용
+function renderDrugTar(data){
+  const dtDiv = document.getElementById('drugtarOut');
+  dtDiv.innerHTML = '';
+
+  const dt = data.drugtar || {};
+  const entries = Object.entries(dt);
+
+  if (entries.length === 0) {
+    dtDiv.innerHTML = '<p class="warn">No DrugTar data available.</p>';
+    // DrugTar 메인 페이지 링크는 항상 달아줌
+    const linkBox = el('div', { class: 'subtle' }, [
+      'Open ',
+      el('a', {
+        href: 'https://drugtar.com/DrugTar',
+        target: '_blank',
+        rel: 'noopener noreferrer',
+      }, 'DrugTar main page'),
+      ' in a new tab.'
+    ]);
+    dtDiv.appendChild(linkBox);
+    return;
+  }
+
+  // 하나의 표에 모든 결과를 모은다.
+  const rows = entries.map(([sym, info]) => ({
+    name: info.uniprot_id || info.name || '',
+    score: info.score_text || '',
+    prediction: info.prediction || '',
+    state: info.state || '',
+  }));
+
+  const tbl = tableFrom(rows, [
+    { key: 'name',       label: 'Name' },
+    { key: 'score',      label: 'Druggability Score' },
+    { key: 'prediction', label: 'DrugTar Prediction' },
+    { key: 'state',      label: 'State' },
+  ], { filename: 'DrugTar_results.csv' });
+
+  // Name(=UniProt ID) 컬럼을 UniProt 링크로 변환
+  tbl.querySelectorAll('tbody tr').forEach(tr => {
+    const nameCell = tr.children[0];
+    const name = nameCell.textContent.trim();
+    if (name) {
+      nameCell.innerHTML =
+        `<a href="https://www.uniprot.org/uniprotkb/${name}" target="_blank" rel="noopener noreferrer">${name}</a>`;
+    }
+  });
+
+  dtDiv.appendChild(tbl);
+
+  // 표 아래 DrugTar 메인 페이지 링크
+  const linkBox = el('div', { class: 'subtle' }, [
+    'Go to ',
+    el('a', {
+      href: 'https://drugtar.com/DrugTar',
+      target: '_blank',
+      rel: 'noopener noreferrer',
+    }, 'DrugTar main page'),
+    ' for more details.'
+  ]);
+  dtDiv.appendChild(linkBox);
+}
+
+
 /* ===== run ===== */
 async function run(){
   const genes=splitSymbols(document.getElementById('genes').value);
   const hz=document.getElementById('hzChk').checked;
   const ot=document.getElementById('otChk').checked;
   const dp=document.getElementById('dpChk').checked;
+  const dt = document.getElementById('dtChk').checked;
   const topn=Number(document.getElementById('topn').value)||15;
   const disease=document.getElementById('disease').value||null;
   const match_mode=document.querySelector('input[name="mode"]:checked').value;
@@ -464,6 +564,7 @@ async function run(){
         fetch_harmonizome:hz,
         fetch_opentargets:ot,
         fetch_drugprotai:dp,
+        fetch_drugtar:dt,
         disease_query:disease,
         match_mode
       })
@@ -481,6 +582,9 @@ async function run(){
     
     if(dp) renderDrugProtAI(data); 
     else document.getElementById('dpOut').innerHTML='';
+
+    if(dt) renderDrugTar(data);                 // NEW
+    else document.getElementById('drugtarOut').innerHTML='';
     
     if(ot) renderOT(); 
     else { document.getElementById('otOut').innerHTML=''; document.getElementById('otLinks').innerHTML=''; document.getElementById('otPagerBottom').innerHTML=''; }

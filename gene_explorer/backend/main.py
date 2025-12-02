@@ -1,5 +1,5 @@
 # =========================
-# backend/main.py (with DrugProtAI)
+# backend/main.py (Updated at 2025.12.02)
 # =========================
 # Run: uvicorn main:app --reload --host 127.0.0.1 --port 8000
 
@@ -32,17 +32,24 @@ SCRAPER_CACHE_TTL = 24 * 3600  # 1일
 SCRAPER_CACHE_DIR = Path(os.getenv("SCRAPER_CACHE_DIR", "/tmp/drugprotai_cache"))
 DRUGPROTAI_TIMEOUT = 240.0
 
-# 캐시 디렉토리 생성은 앱 시작 시점으로 지연
-
 ENSEMBL_LOOKUP   = "https://rest.ensembl.org/lookup/symbol/homo_sapiens/"
 UNIPROT_BASE     = "https://rest.uniprot.org"
 HARMONIZOME_BASE = "https://maayanlab.cloud/Harmonizome/api/1.0/gene/"
 OPENTARGETS_GQL  = "https://api.platform.opentargets.org/api/v4/graphql"
 USER_AGENT = "GeneListExplorerFastAPI/1.5"
 
+# DrugTar settings (web scraper; NOT using GitHub python code)
+DRUGTAR_HOME = "https://drugtar.com/DrugTar"
+DRUGTAR_MIN_INTERVAL = 1.0   # 최소 호출 간격(초) - 과도한 트래픽 방지
+DRUGTAR_CACHE_TTL = 24 * 3600
+DRUGTAR_TIMEOUT = 120.0
+
 # Global state
 _last_scrape_ts = 0.0
-_drugprotai_sem = asyncio.Semaphore(1)  # 동시 실행 제한
+_drugprotai_sem = asyncio.Semaphore(1)  # DrugProtAI 스크레이퍼 동시 실행 제한
+
+_last_drugtar_ts = 0.0
+_drugtar_sem = asyncio.Semaphore(1) # DrugTar 스크레이퍼 동시 실행 제한
 
 # ---- Request model ----
 class AggregateRequest(BaseModel):
@@ -51,10 +58,12 @@ class AggregateRequest(BaseModel):
     fetch_harmonizome: bool = True
     fetch_opentargets: bool = True
     fetch_drugprotai: bool = True
+    fetch_drugtar: bool = True
     disease_query: Optional[str] = None
     match_mode: Optional[str] = "auto"  # "auto" | "simple" | "exact"
 
 # ---------------- HTTP helper ----------------
+# Generate only one HTTP client to enable efficient memory usage
 class HttpJson:
     def __init__(self):
         limits = httpx.Limits(max_connections=20, max_keepalive_connections=20)
@@ -66,6 +75,7 @@ class HttpJson:
         )
 
     async def get(self, url: str, timeout: Optional[float] = None) -> Any:
+        # To avoid temporary network error, try several (3) 
         for attempt in range(RETRIES):
             try:
                 r = await self.client.get(url, timeout=timeout)
@@ -76,6 +86,7 @@ class HttpJson:
                     return r.json()
                 except Exception:
                     # Harmonizome처럼 "JSON + 기타 텍스트"가 섞인 경우 대비
+                    # 문자열만 확보, None 방지
                     text = r.text or ""
 
                     # 본문에서 가장 바깥쪽 { ... } 구간만 추출해서 다시 파싱
@@ -97,21 +108,6 @@ class HttpJson:
                 if attempt == RETRIES - 1:
                     raise
                 await asyncio.sleep(0.5 * (attempt + 1))
-
-#    async def get(self, url: str, timeout: Optional[float] = None) -> Any:
-#        for attempt in range(RETRIES):
-#            try:
-#                r = await self.client.get(url, timeout=timeout)
-#                r.raise_for_status()
-#                try:
-#                    return r.json()
-#                except Exception:
-#                    text = (r.text or "")[:200]
-#                    raise RuntimeError(f"Non-JSON response from GET {url}: {text}")
-#            except Exception:
-#                if attempt == RETRIES - 1:
-#                    raise
-#                await asyncio.sleep(0.5 * (attempt + 1))
 
     async def post_json(self, url: str, body: Dict[str, Any], timeout: Optional[float] = None) -> Any:
         for attempt in range(RETRIES):
@@ -218,7 +214,7 @@ async def fetch_uniprot_id(sym: str) -> Dict[str, Optional[str]]:
         print("UniProt error:", repr(e))
     return {"symbol": sym, "uniprot_id": None}
 
-# Harmonizome: CTD만 사용 + disease_query 매칭
+#### Harmonizome: CTD만 사용 + disease_query 매칭 ####
 async def fetch_harmonizome(symbol: str, disease_query: Optional[str], match_mode: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     url = f"{HARMONIZOME_BASE}{urllib.parse.quote(symbol, safe='')}?showAssociations=true"
     CTD_TOKEN = "CTD+Gene-Disease+Associations"
@@ -498,6 +494,156 @@ async def fetch_drugprotai(uniprot_id: str) -> Dict[str, Any]:
             print(f"✗ Error for {uniprot_id}: {repr(e)}")
             return {}
 
+# ---------------- DrugTar (Playwright) ----------------
+async def _scrape_drugtar(uniprot_ids: List[str]) -> Dict[str, Any]:
+    """
+    DrugTar 웹 UI(https://drugtar.com/DrugTar)에서 'Druggability Prediction' 테이블을 스크랩한다.
+    - 입력: UniProt ID 리스트 (문자열)
+    - 출력: { UniProt ID -> {uniprot_id, score_text, mean_score, prediction, state} } 형태의 dict
+    """
+    global _last_drugtar_ts
+
+    ids = [u for u in (uniprot_ids or []) if u]
+    if not ids:
+        return {}
+
+    # 캐시 키: 정렬된 UniProt ID 목록
+    key = "DRUGTAR::" + " ".join(sorted(ids))
+    ck = _cache_key(key)
+    if ck.exists() and (time.time() - ck.stat().st_mtime) < DRUGTAR_CACHE_TTL:
+        try:
+            print(f"✓ DrugTar cache hit for {ids}")
+            return json.loads(ck.read_text("utf-8"))
+        except Exception:
+            pass
+
+    # Rate limit
+    wait = DRUGTAR_MIN_INTERVAL - (time.time() - _last_drugtar_ts)
+    if wait > 0:
+        await asyncio.sleep(wait)
+
+    result: Dict[str, Any] = {}
+    browser = context = page = None
+
+    try:
+        async with async_playwright() as p:
+            print(f"→ Scraping DrugTar for {ids} ...")
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            context = await browser.new_context(
+                user_agent=USER_AGENT,
+                viewport={"width": 1600, "height": 900},
+            )
+            page = await context.new_page()
+
+            # 1) 페이지 접속
+            await page.goto(DRUGTAR_HOME, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(1500)
+
+            # 2) 검색창(텍스트 영역)에 UniProt ID들을 공백으로 구분해서 입력
+            textarea = page.locator("textarea").first
+            await textarea.wait_for(state="visible", timeout=10000)
+            await textarea.fill(" ".join(ids))
+
+            # 3) Predict 버튼 클릭
+            try:
+                predict_btn = page.get_by_role("button", name=re.compile("predict", re.I))
+            except Exception:
+                predict_btn = page.locator("button:has-text('Predict')").first
+
+            await predict_btn.wait_for(state="visible", timeout=10000)
+            await predict_btn.click()
+            await page.wait_for_timeout(3000)
+
+            # 4) Druggability Prediction 표 대기 및 파싱
+            #    DrugTar UI 상 우측 패널에 하나의 테이블이 있다고 가정
+            table = page.locator("table").first
+            await table.wait_for(state="visible", timeout=30000)
+
+            rows = await table.locator("tbody tr").all()
+            score_re = re.compile(r"([0-9.]+)\s*\(")  # "0.74 (0.69, 0.79)" 에서 0.74 추출용
+
+            for row in rows:
+                cells = await row.locator("td").all_inner_texts()
+                if len(cells) < 4:
+                    continue
+
+                name = cells[0].strip()   # UniProt ID (Name 컬럼)
+                score_text = cells[1].strip()
+                prediction = cells[2].strip()
+                state = cells[3].strip()
+
+                mean_score: Optional[float] = None
+                m = score_re.search(score_text)
+                if m:
+                    try:
+                        mean_score = float(m.group(1))
+                    except ValueError:
+                        pass
+
+                if name:
+                    result[name] = {
+                        "uniprot_id": name,
+                        "score_text": score_text,
+                        "mean_score": mean_score,
+                        "prediction": prediction,
+                        "state": state,
+                    }
+
+            print(f"  ✓ DrugTar rows parsed: {len(result)}")
+
+    except Exception as e:
+        print(f"✗ DrugTar scraping error for {ids}: {repr(e)}")
+
+    finally:
+        if context:
+            try:
+                await context.close()
+            except Exception:
+                pass
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+    _last_drugtar_ts = time.time()
+
+    # 유효 결과만 캐시
+    if result:
+        try:
+            ck.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+            print("  ✓ DrugTar cached")
+        except Exception:
+            pass
+
+    return result
+
+
+async def fetch_drugtar_batch(uniprot_ids: List[str]) -> Dict[str, Any]:
+    """
+    DrugTar에서 UniProt ID 여러 개를 한 번에 조회한다.
+    내부에서는 Playwright를 사용하며, 세마포어로 병렬 호출 수를 제한한다.
+    """
+    ids = [u for u in (uniprot_ids or []) if u]
+    if not ids:
+        return {}
+
+    async with _drugtar_sem:
+        try:
+            return await asyncio.wait_for(_scrape_drugtar(ids), timeout=DRUGTAR_TIMEOUT)
+        except asyncio.TimeoutError:
+            print(f"✗ DrugTar timeout for {ids}")
+            return {}
+        except Exception as e:
+            print(f"✗ DrugTar error for {ids}: {repr(e)}")
+            return {}
+
+
+
+
 # ---------------- routes ----------------
 @app.get("/", response_class=HTMLResponse)
 async def root():
@@ -525,6 +671,11 @@ async def debug_ot(ensembl_id: str, disease_query: Optional[str] = None, match_m
 async def debug_drugprotai(uniprot_id: str):
     data = await fetch_drugprotai(uniprot_id)
     return data
+
+@app.get("/debug/drugtar", response_class=JSONResponse)
+async def debug_drugtar(uniprot: str):
+    data = await fetch_drugtar_batch([uniprot])
+    return data.get(uniprot, {})
 
 @app.post("/aggregate", response_class=JSONResponse)
 async def aggregate(req: AggregateRequest):
@@ -600,6 +751,46 @@ async def aggregate(req: AggregateRequest):
             }
             dp_err[sym] = None
 
+    # 4) DrugTar (웹 UI 스크레이핑, 여러 UniProt을 한 번에 조회)
+    dt: Dict[str, Dict[str, Any]] = {}
+    dt_err: Dict[str, Optional[str]] = {}
+
+    if req.fetch_drugtar:
+        print(f"\nFetching DrugTar data...")
+        all_uids = sorted({m.get("uniprot_id") for m in uniprot_maps if m.get("uniprot_id")})
+        raw_dt = await fetch_drugtar_batch(all_uids)
+
+        for um in uniprot_maps:
+            sym = um["symbol"]
+            uid = um.get("uniprot_id")
+
+            if not uid:
+                dt[sym] = {
+                    "uniprot_id": None,
+                    "score_text": None,
+                    "mean_score": None,
+                    "prediction": None,
+                    "state": None,
+                }
+                dt_err[sym] = "No UniProt ID found"
+                continue
+
+            row = raw_dt.get(uid)
+            if not row:
+                dt[sym] = {
+                    "uniprot_id": uid,
+                    "score_text": None,
+                    "mean_score": None,
+                    "prediction": None,
+                    "state": None,
+                }
+                dt_err[sym] = "Not found in DrugTar"
+            else:
+                # row에는 uniprot_id, score_text, mean_score, prediction, state 존재
+                dt[sym] = dict(row)
+                dt_err[sym] = None
+
+
     # Top-N per gene (OpenTargets)
     topn = max(1, req.topn or 15)
     ot_top: Dict[str, List[Dict[str, Any]]] = {}
@@ -619,4 +810,6 @@ async def aggregate(req: AggregateRequest):
         "opentargets_top": ot_top,
         "drugprotai": dp,
         "drugprotai_errors": dp_err,
+        "drugtar": dt,
+        "drugtar_errors": dt_err,
     }
