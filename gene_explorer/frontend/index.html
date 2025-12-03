@@ -503,26 +503,28 @@ function renderDrugTar(data){
 
   // 하나의 표에 모든 결과를 모은다.
   const rows = entries.map(([sym, info]) => ({
-    name: info.uniprot_id || info.name || '',
+    gene: sym,
+    uniprot_id: info.uniprot_id || info.name || '',
     score: info.score_text || '',
     prediction: info.prediction || '',
     state: info.state || '',
   }));
 
   const tbl = tableFrom(rows, [
-    { key: 'name',       label: 'Name' },
+    { key: 'gene',        label: 'Gene Name' },
+    { key: 'uniprot_id', label: 'UniProt ID' },
     { key: 'score',      label: 'Druggability Score' },
     { key: 'prediction', label: 'DrugTar Prediction' },
     { key: 'state',      label: 'State' },
   ], { filename: 'DrugTar_results.csv' });
 
-  // Name(=UniProt ID) 컬럼을 UniProt 링크로 변환
+  // UniProt ID 컬럼을 UniProt 링크로 변환
   tbl.querySelectorAll('tbody tr').forEach(tr => {
-    const nameCell = tr.children[0];
-    const name = nameCell.textContent.trim();
-    if (name) {
-      nameCell.innerHTML =
-        `<a href="https://www.uniprot.org/uniprotkb/${name}" target="_blank" rel="noopener noreferrer">${name}</a>`;
+    const uniCell = tr.children[1];
+    const uid = uniCell.textContent.trim();
+    if (uid) {
+      uniCell.innerHTML =
+        `<a href="https://www.uniprot.org/uniprotkb/${uid}" target="_blank" rel="noopener noreferrer">${uid}</a>`;
     }
   });
 
