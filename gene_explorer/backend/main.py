@@ -197,22 +197,56 @@ async def map_symbol_to_ensembl(sym: str) -> Dict[str, Optional[str]]:
         return {"symbol": sym, "ensembl_id": None, "matched_symbol": None}
 
 async def fetch_uniprot_id(sym: str) -> Dict[str, Optional[str]]:
-    """Gene symbol -> UniProt ID 변환"""
-    q = f"(gene_exact:{sym}) AND (organism_id:9606) AND (reviewed:true)"
-    url = f"{UNIPROT_BASE}/uniprotkb/search?query={urllib.parse.quote(q)}&fields=accession,reviewed,organism_id&format=json&size=1"
+    """
+    Gene symbol -> UniProt ID 변환
+    
+    우선순위:
+    1. Primary gene name이 정확히 일치하는 reviewed entry
+    2. Annotation score 5/5인 reviewed entry
+    3. 첫 번째 reviewed entry
+    """
+    # 더 많은 결과와 상세 필드를 가져와서 필터링
+    q = f"(gene:{sym}) AND (organism_id:9606) AND (reviewed:true)"
+    url = f"{UNIPROT_BASE}/uniprotkb/search?query={urllib.parse.quote(q)}&fields=accession,gene_names,annotation_score&format=json&size=10"
+    
     try:
         j = await http.get(url)
-        if j.get("results"):
-            return {"symbol": sym, "uniprot_id": j["results"][0]["primaryAccession"]}
-        # fallback
-        q2 = f"(gene:{sym}) AND (organism_id:9606) AND (reviewed:true)"
-        url2 = f"{UNIPROT_BASE}/uniprotkb/search?query={urllib.parse.quote(q2)}&fields=accession&format=json&size=1"
-        j2 = await http.get(url2)
-        if j2.get("results"):
-            return {"symbol": sym, "uniprot_id": j2["results"][0]["primaryAccession"]}
+        results = j.get("results", [])
+        
+        if not results:
+            return {"symbol": sym, "uniprot_id": None}
+        
+        # 1순위: Primary gene name이 정확히 일치
+        exact_matches = []
+        for entry in results:
+            genes = entry.get("genes", [])
+            if genes:
+                # geneName 객체에서 value 추출
+                primary = genes[0].get("geneName", {}).get("value", "")
+                if primary.upper() == sym.upper():
+                    exact_matches.append(entry)
+        
+        if len(exact_matches) == 1:
+            # 정확히 하나만 일치 -> 확실한 매칭
+            return {"symbol": sym, "uniprot_id": exact_matches[0]["primaryAccession"]}
+        
+        if len(exact_matches) > 1:
+            # 여러 개 일치 -> annotation score로 선택
+            best = max(exact_matches, key=lambda e: e.get("annotationScore", 0))
+            return {"symbol": sym, "uniprot_id": best["primaryAccession"]}
+        
+        # 2순위: annotation score 5/5 중 첫 번째
+        high_quality = [e for e in results if e.get("annotationScore", 0) == 5]
+        if high_quality:
+            return {"symbol": sym, "uniprot_id": high_quality[0]["primaryAccession"]}
+        
+        # 3순위: 첫 번째 결과 (이미 reviewed & human으로 필터됨)
+        return {"symbol": sym, "uniprot_id": results[0]["primaryAccession"]}
+        
     except Exception as e:
-        print("UniProt error:", repr(e))
-    return {"symbol": sym, "uniprot_id": None}
+        print(f"UniProt error for {sym}:", repr(e))
+        return {"symbol": sym, "uniprot_id": None}
+
 
 #### Harmonizome: CTD만 사용 + disease_query 매칭 ####
 async def fetch_harmonizome(symbol: str, disease_query: Optional[str], match_mode: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
