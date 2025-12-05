@@ -1,6 +1,6 @@
 # GeneFromAPI
 ---
-GeneFromAPI is website for gene searching with open API. It used Harmonizome and OpenTarget API. Especially only CTD Gene-Disease Associations Dataset was used from Harmonizome.
+GeneFromAPI is website for gene searching with open API. It used DrugProtAI, DrugTar, Harmonizome and OpenTarget API. Especially only CTD Gene-Disease Associations Dataset was used from Harmonizome.
 
 
 ## Using the GeneFromAPI `Docker` image
@@ -41,3 +41,7 @@ docker compose -f docker_compose.yml down # Delete docker container
 Diamant I, Clarke DJB, Evangelista JE, Lingam N, Ma'ayan A. Harmonizome 3.0: integrated knowledge about genes and proteins from diverse multi-omics resources. Nucleic Acids Res. 2024 Nov 20. pii: 53(1):D1016-D1028.
 
 Buniello, A. et al. (2025). Open Targets Platform: facilitating therapeutic hypotheses building in drug discovery. Nucleic Acids Research.
+
+Ankit Halder, Sabyasachi Samantaray, Sahil Barbade, Aditya Gupta, Sanjeeva Srivastava, DrugProtAI: A machine learning–driven approach for predicting protein druggability through feature engineering and robust partition-based ensemble methods, Briefings in Bioinformatics, Volume 26, Issue 4, July 2025, bbaf330, https://doi.org/10.1093/bib/bbaf330
+
+Niloofar Borhani, Iman Izadi, Ali Motahharynia, Mahsa Sheikholeslami, Yousof Gheisari, DrugTar improves druggability prediction by integrating large language models and gene ontologies, Bioinformatics, Volume 41, Issue 7, July 2025, btaf360, https://doi.org/10.1093/bioinformatics/btaf360
